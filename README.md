@@ -2,6 +2,10 @@
 
 AI and IoT-based navigation and safety assistance prototype. The existing web application supports a simulation-first dashboard and an optional Web Bluetooth connection to an ESP32 wearable.
 
+## Live Demo
+
+[Open SmartVision Wearable](https://smartvision-wearable.vercel.app/)
+
 ## Run the Application
 
 ```powershell
