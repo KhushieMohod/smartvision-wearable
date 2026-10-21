@@ -15,6 +15,7 @@ export type BleRuntimeState = {
   connected: boolean
   available: boolean
   status: string
+  wearableStatus: string | null
   deviceName: string
   lastPacket: string
   lastPacketTime: string
@@ -22,12 +23,23 @@ export type BleRuntimeState = {
 }
 
 type BleCharacteristic = {
-  properties: { notify?: boolean; indicate?: boolean; write?: boolean; writeWithoutResponse?: boolean }
+  properties: { notify?: boolean; indicate?: boolean; read?: boolean; write?: boolean; writeWithoutResponse?: boolean }
   value?: DataView | ArrayBuffer
   addEventListener: (type: string, listener: (event: { target: BleCharacteristic }) => void) => void
   removeEventListener: (type: string, listener: (event: { target: BleCharacteristic }) => void) => void
   startNotifications: () => Promise<void>
+  readValue: () => Promise<DataView | ArrayBuffer>
   writeValue: (value: Uint8Array) => Promise<void>
+}
+
+function parseStatusPayload(raw: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(raw.trim())
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) && typeof (parsed as Record<string, unknown>).state === 'string') {
+      return (parsed as Record<string, unknown>).state as string
+    }
+  } catch { /* ignore invalid JSON */ }
+  return null
 }
 
 type BleGattService = {
@@ -67,6 +79,7 @@ export function useSmartVisionBle(callbacks: BleCallbacks) {
     connected: false,
     available: typeof navigator !== 'undefined' && 'bluetooth' in navigator,
     status: 'Disconnected',
+    wearableStatus: null,
     deviceName: DEVICE_NAME,
     lastPacket: 'No packet received',
     lastPacketTime: 'Waiting for telemetry',
@@ -76,6 +89,7 @@ export function useSmartVisionBle(callbacks: BleCallbacks) {
   const clientRef = useRef<BleClient | null>(null)
   const disconnectListenerRef = useRef<(() => void) | null>(null)
   const telemetryListenerRef = useRef<((event: { target: BleCharacteristic }) => void) | null>(null)
+  const statusListenerRef = useRef<((event: { target: BleCharacteristic }) => void) | null>(null)
   const invalidPacketReportedRef = useRef(false)
 
   useEffect(() => {
@@ -96,15 +110,20 @@ export function useSmartVisionBle(callbacks: BleCallbacks) {
     if (telemetryListenerRef.current) {
       client.telemetryCharacteristic.removeEventListener('characteristicvaluechanged', telemetryListenerRef.current)
     }
+    if (statusListenerRef.current) {
+      client.statusCharacteristic.removeEventListener('characteristicvaluechanged', statusListenerRef.current)
+    }
 
     clientRef.current = null
     disconnectListenerRef.current = null
     telemetryListenerRef.current = null
+    statusListenerRef.current = null
     invalidPacketReportedRef.current = false
     setState((previous) => ({
       ...previous,
       connected: false,
       status: 'Disconnected',
+      wearableStatus: null,
       deviceName: DEVICE_NAME,
       lastPacket: 'No packet received',
       lastPacketTime: 'Waiting for telemetry',
@@ -201,10 +220,38 @@ export function useSmartVisionBle(callbacks: BleCallbacks) {
       device.addEventListener('gattserverdisconnected', onDisconnect)
 
       await telemetryCharacteristic.startNotifications()
+
+      // Read initial status value
+      let initialWearableStatus: string | null = null
+      try {
+        const rawStatusValue = await statusCharacteristic.readValue()
+        const statusText = new TextDecoder().decode(rawStatusValue)
+        initialWearableStatus = parseStatusPayload(statusText)
+      } catch { /* status read is best-effort */ }
+
+      // Subscribe to status notifications if supported
+      if (statusCharacteristic.properties.notify || statusCharacteristic.properties.indicate) {
+        const onStatusChange = (event: { target: BleCharacteristic }) => {
+          const value = event.target.value
+          const raw = value ? new TextDecoder().decode(value) : ''
+          const parsed = parseStatusPayload(raw)
+          if (parsed !== null) {
+            updateState({ wearableStatus: parsed })
+            callbacksRef.current.onEvent(`Wearable status: ${parsed}`)
+          }
+        }
+        statusListenerRef.current = onStatusChange
+        statusCharacteristic.addEventListener('characteristicvaluechanged', onStatusChange)
+        try {
+          await statusCharacteristic.startNotifications()
+        } catch { /* status notifications are optional */ }
+      }
+
       updateState({
         connected: true,
         available: true,
         status: 'Connected',
+        wearableStatus: initialWearableStatus,
         deviceName: device.name || DEVICE_NAME,
         lastPacket: 'Waiting for first valid telemetry packet',
         lastPacketTime: 'Waiting for telemetry',
@@ -227,11 +274,13 @@ export function useSmartVisionBle(callbacks: BleCallbacks) {
       if (client) {
         if (disconnectListenerRef.current) client.device.removeEventListener('gattserverdisconnected', disconnectListenerRef.current)
         if (telemetryListenerRef.current) client.telemetryCharacteristic.removeEventListener('characteristicvaluechanged', telemetryListenerRef.current)
+        if (statusListenerRef.current) client.statusCharacteristic.removeEventListener('characteristicvaluechanged', statusListenerRef.current)
       }
       device?.gatt?.disconnect()
       clientRef.current = null
       disconnectListenerRef.current = null
       telemetryListenerRef.current = null
+      statusListenerRef.current = null
       updateState({ connected: false, status: 'Disconnected', deviceName: DEVICE_NAME, error: message })
     }
   }
@@ -249,14 +298,19 @@ export function useSmartVisionBle(callbacks: BleCallbacks) {
     if (telemetryListenerRef.current) {
       client.telemetryCharacteristic.removeEventListener('characteristicvaluechanged', telemetryListenerRef.current)
     }
+    if (statusListenerRef.current) {
+      client.statusCharacteristic.removeEventListener('characteristicvaluechanged', statusListenerRef.current)
+    }
     if (client.device.gatt?.connected) client.device.gatt.disconnect()
     clientRef.current = null
     disconnectListenerRef.current = null
     telemetryListenerRef.current = null
+    statusListenerRef.current = null
     invalidPacketReportedRef.current = false
     updateState({
       connected: false,
       status: 'Disconnected',
+      wearableStatus: null,
       deviceName: DEVICE_NAME,
       lastPacket: 'No packet received',
       lastPacketTime: 'Waiting for telemetry',

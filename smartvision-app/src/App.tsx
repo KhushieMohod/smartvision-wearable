@@ -38,6 +38,20 @@ type DeviceSettings = {
 type ActiveTab = 'dashboard' | 'settings' | 'documentation'
 type MapTileTheme = 'dark' | 'standard' | 'contrast'
 
+type SessionLogEntry = {
+  timestamp: string
+  front: number
+  dangerLevel: 'clear' | 'warning' | 'danger'
+  sos: boolean
+  fall: boolean
+}
+
+function computeDangerLevel(front: number, threshold: number): 'clear' | 'warning' | 'danger' {
+  if (front < threshold * 0.5) return 'danger'
+  if (front < threshold) return 'warning'
+  return 'clear'
+}
+
 // ── Web Audio Synthesizer (Zero external dependencies) ─────────────────────────
 
 class WebAudioService {
@@ -555,6 +569,12 @@ function App() {
     aiObject: 'Sidewalk clear — Crosswalk in 4.5m',
   })
 
+  // Streaming control & session log (live mode only)
+  const [wantsStreaming, setWantsStreaming] = useState(false)
+  const wantsStreamingRef = useRef(false)
+  const [sessionLog, setSessionLog] = useState<SessionLogEntry[]>([])
+  const sendCommandRef = useRef<((command: 'start' | 'stop' | 'reset_emergency' | 'vibrate') => Promise<void>) | null>(null)
+
   // ── Logging Helper ─────────────────────────────────────────────────────────
   const addIncident = (type: IncidentType, message: string) => {
     const entry: IncidentEntry = {
@@ -569,10 +589,23 @@ function App() {
   }
 
   // ── BLE Hardware Connection Hook ───────────────────────────────────────────
-  const { state: bleState, connect: connectWearable, disconnect: disconnectWearable } = useSmartVisionBle({
+  const { state: bleState, connect: connectWearable, disconnect: disconnectWearable, sendCommand } = useSmartVisionBle({
     onTelemetry: (telemetry) => {
       setHardwareTelemetry(telemetry)
       setLastUpdate(formatTime())
+
+      // Session log: record one row per live packet
+      setSessionLog(prev => {
+        const entry: SessionLogEntry = {
+          timestamp: new Date().toISOString(),
+          front: telemetry.front,
+          dangerLevel: computeDangerLevel(telemetry.front, settings.tofWarningThreshold),
+          sos: telemetry.sos,
+          fall: telemetry.fall,
+        }
+        const next = [...prev, entry]
+        return next.length > 5000 ? next.slice(-5000) : next
+      })
 
       if (telemetry.sos && !hardwareFlagsRef.current.sos) {
         setSosActive(true)
@@ -599,6 +632,8 @@ function App() {
     onDisconnected: () => {
       setHardwareTelemetry(null)
       hardwareFlagsRef.current = { fall: false, sos: false }
+      setWantsStreaming(false)
+      wantsStreamingRef.current = false
       addIncident('SYSTEM', 'ESP32 Bluetooth disconnected — reverted to cloud bridge telemetry')
     },
     onEvent: () => {
@@ -607,6 +642,30 @@ function App() {
   })
 
   const isOnline = bleState.connected
+
+  // Keep refs in sync
+  useEffect(() => { wantsStreamingRef.current = wantsStreaming }, [wantsStreaming])
+  useEffect(() => { sendCommandRef.current = sendCommand }, [sendCommand])
+
+  // Auto-send start command on fresh connection if user already toggled streaming
+  const prevConnectedRef = useRef(false)
+  useEffect(() => {
+    const justConnected = isOnline && !prevConnectedRef.current
+    prevConnectedRef.current = isOnline
+    if (justConnected && wantsStreamingRef.current) {
+      sendCommandRef.current?.('start')
+    }
+  }, [isOnline])
+
+  // Toggle streaming command
+  const toggleStreaming = () => {
+    const next = !wantsStreaming
+    setWantsStreaming(next)
+    wantsStreamingRef.current = next
+    if (isOnline) {
+      sendCommand(next ? 'start' : 'stop')
+    }
+  }
 
   // ── Live Movement Simulation (Walk Traversal) ──────────────────────────────
   useEffect(() => {
@@ -738,6 +797,26 @@ function App() {
     URL.revokeObjectURL(url)
   }
 
+  // ── Export Session Log to CSV ───────────────────────────────────────────────
+  const exportSessionLogCsv = () => {
+    const headers = ['Timestamp', 'Front (cm)', 'Danger Level', 'SOS', 'Fall']
+    const rows = sessionLog.map(entry => [
+      `"${entry.timestamp}"`,
+      entry.front,
+      entry.dangerLevel,
+      entry.sos,
+      entry.fall,
+    ])
+    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n')
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `SmartVision-Session-Log-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.csv`
+    link.click()
+    URL.revokeObjectURL(url)
+  }
+
   // ── Settings Handlers ──────────────────────────────────────────────────────
   const updateSetting = <K extends keyof DeviceSettings>(key: K, value: DeviceSettings[K]) => {
     setSettings(prev => ({ ...prev, [key]: value }))
@@ -792,9 +871,9 @@ function App() {
 
   // Current battery & sensor values
   const batteryLevel = isOnline && hardwareTelemetry ? hardwareTelemetry.battery : simulatedSensors.batteryPct
-  const leftDistance = isOnline && hardwareTelemetry ? hardwareTelemetry.left : simulatedSensors.leftCm
+  const leftDistance: number | null = isOnline && hardwareTelemetry ? hardwareTelemetry.left : simulatedSensors.leftCm
   const frontDistance = isOnline && hardwareTelemetry ? hardwareTelemetry.front : simulatedSensors.frontCm
-  const rightDistance = isOnline && hardwareTelemetry ? hardwareTelemetry.right : simulatedSensors.rightCm
+  const rightDistance: number | null = isOnline && hardwareTelemetry ? hardwareTelemetry.right : simulatedSensors.rightCm
 
   // Emergency contact direct SMS link
   const emergencySmsUrl = `sms:${settings.primaryContact}?body=${encodeURIComponent(
@@ -898,6 +977,19 @@ function App() {
 
           {/* Hardware Connection Action */}
           <div className="flex items-center gap-2.5">
+            {isOnline && (
+              <button
+                type="button"
+                onClick={toggleStreaming}
+                className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold transition-all ${wantsStreaming
+                  ? 'border border-warning-500/40 bg-warning-500/15 text-warning-400 hover:bg-warning-500/25'
+                  : 'border border-success-500/40 bg-success-500/10 text-success-400 hover:bg-success-500/20'
+                  }`}
+              >
+                <span className={`h-2 w-2 rounded-full ${wantsStreaming ? 'bg-warning-400 animate-pulse' : 'bg-success-400'}`} />
+                {wantsStreaming ? 'Stop Streaming' : 'Start Streaming'}
+              </button>
+            )}
             <button
               type="button"
               onClick={isOnline ? disconnectWearable : connectWearable}
@@ -973,6 +1065,14 @@ function App() {
                     ? 'Receiving 10Hz telemetry stream over BLE GATT'
                     : 'Transmitting over smartphone cellular gateway'}
                 </p>
+                {isOnline && bleState.wearableStatus && (
+                  <div className="mt-2 flex items-center gap-1.5">
+                    <div className="h-1.5 w-1.5 rounded-full bg-primary-400" />
+                    <span className="text-[11px] font-semibold text-primary-300">
+                      Wearable: {bleState.wearableStatus}
+                    </span>
+                  </div>
+                )}
               </div>
 
               {/* Card 2: Battery Gauge */}
@@ -1121,14 +1221,21 @@ function App() {
                     <div>
                       <div className="flex justify-between text-xs">
                         <span className="font-semibold text-surface-300">Left Sector</span>
-                        <span className="font-mono-numbers font-bold text-white">{leftDistance} cm</span>
+                        <span className="font-mono-numbers font-bold text-white">{leftDistance !== null ? `${leftDistance} cm` : 'No sensor'}</span>
                       </div>
                       <div className="mt-1 h-2 w-full rounded-full bg-surface-800">
-                        <div
-                          className={`h-full rounded-full transition-all duration-300 ${leftDistance < 50 ? 'bg-danger-500' : leftDistance < 100 ? 'bg-warning-500' : 'bg-primary-500'
-                            }`}
-                          style={{ width: `${Math.min(100, (leftDistance / 200) * 100)}%` }}
-                        />
+                        {leftDistance !== null ? (
+                          <div
+                            className={`h-full rounded-full transition-all duration-300 ${leftDistance < 50 ? 'bg-danger-500' : leftDistance < 100 ? 'bg-warning-500' : 'bg-primary-500'
+                              }`}
+                            style={{ width: `${Math.min(100, (leftDistance / 200) * 100)}%` }}
+                          />
+                        ) : (
+                          <div
+                            className="h-full rounded-full bg-surface-600"
+                            style={{ width: '100%', opacity: 0.35 }}
+                          />
+                        )}
                       </div>
                     </div>
 
@@ -1151,14 +1258,21 @@ function App() {
                     <div>
                       <div className="flex justify-between text-xs">
                         <span className="font-semibold text-surface-300">Right Sector</span>
-                        <span className="font-mono-numbers font-bold text-white">{rightDistance} cm</span>
+                        <span className="font-mono-numbers font-bold text-white">{rightDistance !== null ? `${rightDistance} cm` : 'No sensor'}</span>
                       </div>
                       <div className="mt-1 h-2 w-full rounded-full bg-surface-800">
-                        <div
-                          className={`h-full rounded-full transition-all duration-300 ${rightDistance < 50 ? 'bg-danger-500' : rightDistance < 100 ? 'bg-warning-500' : 'bg-primary-500'
-                            }`}
-                          style={{ width: `${Math.min(100, (rightDistance / 200) * 100)}%` }}
-                        />
+                        {rightDistance !== null ? (
+                          <div
+                            className={`h-full rounded-full transition-all duration-300 ${rightDistance < 50 ? 'bg-danger-500' : rightDistance < 100 ? 'bg-warning-500' : 'bg-primary-500'
+                              }`}
+                            style={{ width: `${Math.min(100, (rightDistance / 200) * 100)}%` }}
+                          />
+                        ) : (
+                          <div
+                            className="h-full rounded-full bg-surface-600"
+                            style={{ width: '100%', opacity: 0.35 }}
+                          />
+                        )}
                       </div>
                     </div>
                   </div>
@@ -1393,6 +1507,70 @@ function App() {
                 </div>
               </div>
             </section>
+
+            {/* ── Live Session Log (Hardware Mode Only) ── */}
+            {isOnline && sessionLog.length > 0 && (
+              <section className="premium-card p-5">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.08] pb-3">
+                  <div>
+                    <h3 className="text-sm font-bold text-white">Live Session Telemetry Log</h3>
+                    <p className="text-xs text-surface-400">
+                      {sessionLog.length.toLocaleString()} packet{sessionLog.length !== 1 ? 's' : ''} recorded this session (max 5,000)
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={exportSessionLogCsv}
+                      className="flex items-center gap-1.5 rounded-lg border border-white/10 bg-surface-900 px-2.5 py-1.5 text-xs font-bold text-surface-300 hover:bg-surface-800 hover:text-white"
+                    >
+                      <IconDownload className="h-3.5 w-3.5" />
+                      Download CSV
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSessionLog([])}
+                      className="rounded-lg border border-white/10 bg-surface-900 px-2.5 py-1.5 text-xs font-semibold text-surface-400 hover:text-danger-400"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-3 max-h-[220px] overflow-y-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="sticky top-0 border-b border-white/[0.08] bg-surface-900/95 text-surface-400">
+                        <th className="pb-2 font-semibold">Time</th>
+                        <th className="pb-2 font-semibold">Front</th>
+                        <th className="pb-2 font-semibold">Danger</th>
+                        <th className="pb-2 font-semibold">SOS</th>
+                        <th className="pb-2 font-semibold">Fall</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/[0.04] text-surface-200">
+                      {sessionLog.slice(-50).reverse().map((entry, i) => (
+                        <tr key={`sl-${i}`}>
+                          <td className="py-1.5 font-mono-numbers text-[11px] text-surface-400">{entry.timestamp.slice(11, 23)}</td>
+                          <td className="py-1.5 font-mono-numbers">{entry.front} cm</td>
+                          <td className="py-1.5">
+                            <span className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                              entry.dangerLevel === 'danger'
+                                ? 'bg-danger-500/20 text-danger-400'
+                                : entry.dangerLevel === 'warning'
+                                  ? 'bg-warning-500/20 text-warning-400'
+                                  : 'bg-success-500/15 text-success-400'
+                            }`}>{entry.dangerLevel}</span>
+                          </td>
+                          <td className="py-1.5">{entry.sos ? <span className="text-danger-400 font-bold">YES</span> : '—'}</td>
+                          <td className="py-1.5">{entry.fall ? <span className="text-warning-400 font-bold">YES</span> : '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            )}
           </div>
         )}
 

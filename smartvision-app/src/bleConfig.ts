@@ -9,9 +9,9 @@ export const SMARTVISION_STATUS_UUID = '19b10003-e8f2-537e-4f6c-d104768a1214'
 export type BleCommandSide = 'left' | 'right' | 'front'
 
 export type HardwareTelemetry = {
-  left: number
+  left: number | null
   front: number
-  right: number
+  right: number | null
   battery: number | null
   fall: boolean
   sos: boolean
@@ -35,6 +35,14 @@ function parseBoolean(value: unknown): boolean | null {
   return null
 }
 
+function parseOptionalDistance(value: unknown): number | null | 'invalid' {
+  if (value == null) return null
+  const n = Number(value)
+  if (!Number.isFinite(n)) return 'invalid'
+  if (n <= 0 || n > 1000) return 'invalid'
+  return n
+}
+
 function buildTelemetry(
   leftValue: unknown,
   frontValue: unknown,
@@ -45,9 +53,9 @@ function buildTelemetry(
   sosValue: unknown,
   timestampValue: unknown,
 ): HardwareTelemetry | null {
-  const left = Number(leftValue)
   const front = Number(frontValue)
-  const right = Number(rightValue)
+  const left = parseOptionalDistance(leftValue)
+  const right = parseOptionalDistance(rightValue)
   const battery = batteryValue == null ? null : Number(batteryValue)
   const hasImu = isRecord(imuValue) && ['ax', 'ay', 'az'].every((axis) => imuValue[axis] != null && Number.isFinite(Number(imuValue[axis])))
   const imu = hasImu && isRecord(imuValue)
@@ -57,8 +65,9 @@ function buildTelemetry(
   const sos = parseBoolean(sosValue)
 
   if (
-    ![left, front, right].every(Number.isFinite) ||
-    [left, front, right].some((distance) => distance <= 0 || distance > 1000) ||
+    !Number.isFinite(front) || front <= 0 || front > 1000 ||
+    left === 'invalid' ||
+    right === 'invalid' ||
     (battery !== null && (!Number.isFinite(battery) || battery < 0 || battery > 100)) ||
     fall === null ||
     sos === null
@@ -67,9 +76,9 @@ function buildTelemetry(
   }
 
   return {
-    left,
+    left: left as number | null,
     front,
-    right,
+    right: right as number | null,
     battery,
     fall,
     sos,
@@ -110,14 +119,14 @@ export function parseTelemetryPayload(raw: string): HardwareTelemetry | null {
     values[key.trim().toLowerCase()] = Number(value.trim())
   }
 
-  if (!('left' in values || 'leftdistance' in values) || !('front' in values || 'frontdistance' in values) || !('right' in values || 'rightdistance' in values)) {
+  if (!('front' in values || 'frontdistance' in values)) {
     return null
   }
 
   return buildTelemetry(
-    values.left ?? values.leftdistance,
+    values.left ?? values.leftdistance ?? null,
     values.front ?? values.frontdistance,
-    values.right ?? values.rightdistance,
+    values.right ?? values.rightdistance ?? null,
     values.battery ?? values.power ?? null,
     { ax: values.ax, ay: values.ay, az: values.az },
     values.fall ?? values.falldetected,
